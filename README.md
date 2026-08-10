@@ -2,6 +2,8 @@
 
 Terminal control panel (Rust TUI) for managing multiple [Claude Code](https://claude.com/claude-code)
 sessions running in tmux.
+<img width="1832" height="1000" alt="image" src="https://github.com/user-attachments/assets/aefd49fa-067a-4549-9bee-9754e2f24146" />
+
 
 - **Left panel** — list of Claude Code sessions.
 - **Right panel** — a *real* tmux client embedded in a PTY (via [tui-term](https://crates.io/crates/tui-term)),
