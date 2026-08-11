@@ -15,10 +15,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
@@ -28,7 +28,7 @@ const HELP: &[&str] = &[
     "Ctrl+G    go to window",
     "F6 / F7   restart / danger",
     "Ctrl+L    refresh",
-    "F2        mouse toggle",
+    "F2        mouse off (select text)",
     "Ctrl+Q    quit · Esc stop",
 ];
 use tui_term::widget::PseudoTerminal;
@@ -111,12 +111,32 @@ fn short_path(path: &str) -> String {
     parts[parts.len().saturating_sub(2)..].join("/")
 }
 
+// Reads .git/HEAD directly (no git subprocess). For worktrees/submodules, .git is
+// a FILE ("gitdir: <dir>") whose HEAD lives in that dir — resolve it there.
+fn git_branch(path: &str) -> String {
+    let dotgit = format!("{path}/.git");
+    let head_path = match std::fs::read_to_string(&dotgit) {
+        Ok(s) => match s.trim().strip_prefix("gitdir:") {
+            Some(dir) => format!("{}/HEAD", dir.trim()),
+            None => format!("{dotgit}/HEAD"),
+        },
+        Err(_) => format!("{dotgit}/HEAD"), // .git is a dir → read_to_string errored
+    };
+    let head = std::fs::read_to_string(&head_path).unwrap_or_default();
+    let head = head.trim();
+    match head.strip_prefix("ref: refs/heads/") {
+        Some(b) => b.to_string(),
+        None => head.chars().take(7).collect(), // detached HEAD → short sha
+    }
+}
+
 struct Pane {
     id: String,
     session: String,
     window: String,
     name: String,
     path: String,
+    branch: String,
     status: String,
 }
 
@@ -141,11 +161,13 @@ fn list_claude_panes() -> Vec<Pane> {
                     window: window.into(),
                     name: name.into(),
                     path: path.into(),
+                    branch: git_branch(path),
                     status: read_status(&home, id),
                 });
             }
         }
     }
+    v.sort_by(|a, b| a.session.cmp(&b.session)); // keep same-session panes contiguous for grouping
     v
 }
 
@@ -294,10 +316,12 @@ fn refresh_panes(prev: &[Pane]) -> Vec<Pane> {
                 window: p.window.clone(),
                 name: p.name.clone(),
                 path: p.path.clone(),
+                branch: p.branch.clone(),
                 status: "dead".into(),
             });
         }
     }
+    out.sort_by(|a, b| a.session.cmp(&b.session));
     out
 }
 
@@ -307,6 +331,56 @@ fn step(state: &mut ListState, len: usize, delta: isize) {
     }
     let cur = state.selected().unwrap_or(0) as isize;
     state.select(Some((cur + delta).rem_euclid(len as isize) as usize));
+}
+
+// Contiguous runs of same-session panes → (session, start_index, count). panes is
+// kept session-sorted, so each session is one group.
+fn group_bounds(panes: &[Pane]) -> Vec<(String, usize, usize)> {
+    let mut groups: Vec<(String, usize, usize)> = Vec::new();
+    for (i, p) in panes.iter().enumerate() {
+        match groups.last_mut() {
+            Some(g) if g.0 == p.session => g.2 += 1,
+            _ => groups.push((p.session.clone(), i, 1)),
+        }
+    }
+    groups
+}
+
+// One bordered box per group, stacked vertically. Each pane is 2 rows + 2 border rows.
+// ponytail: no scroll — if the groups don't fit, lower ones clip. Add a scroll offset
+// if you routinely run more sessions than fit the left column.
+fn group_rects(area: Rect, groups: &[(String, usize, usize)]) -> Vec<Rect> {
+    let cons: Vec<Constraint> = groups.iter().map(|g| Constraint::Length(2 + 2 * g.2 as u16)).collect();
+    Layout::default().direction(Direction::Vertical).constraints(cons).split(area).to_vec()
+}
+
+fn pane_item(p: &Pane, frame: usize, tick: u128) -> ListItem<'static> {
+    let (mark, mark_style) = match p.status.as_str() {
+        "active" => (SPIN[frame % SPIN.len()], Style::default().fg(Color::Rgb(215, 119, 87))),
+        "perm" => ("●", Style::default().fg(Color::Rgb(240, 200, 40))),
+        "dead" => ("✖", Style::default().fg(Color::Rgb(230, 80, 80))),
+        _ => ("●", Style::default().fg(Color::Rgb(166, 227, 161))),
+    };
+    let mut path = vec![Span::styled(format!("{mark} "), mark_style)];
+    if p.status == "active" {
+        path.extend(shimmer(&short_path(&p.path), tick));
+    } else {
+        path.push(Span::styled(short_path(&p.path), Style::default().fg(Color::White)));
+    }
+    if p.status == "dead" {
+        path.push(Span::styled(" (crashed)", mark_style));
+    }
+    ListItem::new(vec![
+        Line::from(path),
+        if p.branch.is_empty() {
+            Line::from("")
+        } else {
+            Line::from(Span::styled(
+                format!("  ⎇ {}", p.branch.rsplit('/').next().unwrap_or(&p.branch)),
+                Style::default().fg(Color::Rgb(137, 180, 250)),
+            ))
+        },
+    ])
 }
 
 // ccorral's own tmux session. Panes in it can't be embedded: attaching a second
@@ -396,52 +470,31 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         let frame = (tick / 120) as usize;
 
         terminal.draw(|f| {
-            let items: Vec<ListItem> = panes
-                .iter()
-                .map(|p| {
-                    let name = if p.status == "active" {
-                        let mut spans = vec![
-                            Span::styled(SPIN[frame % SPIN.len()], Style::default().fg(Color::Rgb(215, 119, 87))),
-                            Span::raw(" "),
-                        ];
-                        spans.extend(shimmer(&p.name, tick));
-                        Line::from(spans)
-                    } else if p.status == "perm" {
-                        let yellow = Style::default().fg(Color::Rgb(240, 200, 40));
-                        Line::from(vec![
-                            Span::styled("●", yellow),
-                            Span::styled(format!(" {}", p.name), yellow),
-                        ])
-                    } else if p.status == "dead" {
-                        let red = Style::default().fg(Color::Rgb(230, 80, 80));
-                        Line::from(vec![
-                            Span::styled("✖", red),
-                            Span::styled(format!(" {} (crashed)", p.name), red),
-                        ])
-                    } else {
-                        Line::from(vec![
-                            Span::styled("●", Style::default().fg(Color::Rgb(166, 227, 161))),
-                            Span::raw(format!(" {}", p.name)),
-                        ])
-                    };
-                    ListItem::new(vec![
-                        name,
-                        Line::from(Span::styled(
-                            format!("  {}", short_path(&p.path)),
-                            Style::default().add_modifier(Modifier::DIM),
-                        )),
-                    ])
-                })
-                .collect();
-            // left column = list on top, shortcut help box below it
+            // left column = grouped session boxes on top, shortcut help box below it
             let left = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(3), Constraint::Length(HELP.len() as u16 + 2)])
                 .split(chunks[0]);
-            let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(" claude "))
-                .highlight_style(Style::default().bg(Color::Rgb(69, 71, 90)));
-            f.render_stateful_widget(list, left[0], &mut state);
+            let groups = group_bounds(&panes);
+            let rects = group_rects(left[0], &groups);
+            for (gi, (session, start, count)) in groups.iter().enumerate() {
+                let rect = rects[gi];
+                if rect.height < 3 {
+                    continue;
+                }
+                let items: Vec<ListItem> =
+                    panes[*start..*start + *count].iter().map(|p| pane_item(p, frame, tick)).collect();
+                let mut lstate = ListState::default();
+                if let Some(sel) = state.selected() {
+                    if sel >= *start && sel < *start + *count {
+                        lstate.select(Some(sel - *start));
+                    }
+                }
+                let list = List::new(items)
+                    .block(Block::default().borders(Borders::ALL).title(format!(" {session} ")))
+                    .highlight_style(Style::default().bg(Color::Rgb(69, 71, 90)));
+                f.render_stateful_widget(list, rect, &mut lstate);
+            }
 
             let help: Vec<Line> = HELP
                 .iter()
@@ -468,6 +521,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
                         status,
                         Span::raw(format!(" {}  ", p.name)),
                         Span::styled(short_path(&p.path), Style::default().add_modifier(Modifier::DIM)),
+                        Span::styled(
+                            if p.branch.is_empty() { String::new() } else { format!("  ⎇ {}", p.branch) },
+                            Style::default().fg(Color::Rgb(137, 180, 250)),
+                        ),
                         Span::raw(" "),
                     ])
                 }
@@ -495,10 +552,39 @@ fn run(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
         }
         let ev = event::read()?;
         if let Event::Mouse(m) = ev {
-            if matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
-                if let Some(p) = state.selected().and_then(|i| panes.get(i)) {
-                    scroll(&p.id, matches!(m.kind, MouseEventKind::ScrollUp));
+            match m.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    if let Some(p) = state.selected().and_then(|i| panes.get(i)) {
+                        scroll(&p.id, matches!(m.kind, MouseEventKind::ScrollUp));
+                    }
                 }
+                // click a session in a group box → select + (debounced) attach
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let list_area = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([Constraint::Min(3), Constraint::Length(HELP.len() as u16 + 2)])
+                        .split(chunks[0])[0];
+                    let groups = group_bounds(&panes);
+                    let rects = group_rects(list_area, &groups);
+                    for (gi, (_s, start, count)) in groups.iter().enumerate() {
+                        let r = rects[gi];
+                        let inner_y = r.y + 1; // skip top border; each pane is 3 rows tall
+                        let inside = m.column > r.x
+                            && m.column < r.x + r.width.saturating_sub(1)
+                            && m.row >= inner_y
+                            && m.row < r.y + r.height.saturating_sub(1);
+                        if inside {
+                            let local = ((m.row - inner_y) / 2) as usize;
+                            let idx = start + local.min(count.saturating_sub(1));
+                            if state.selected() != Some(idx) {
+                                state.select(Some(idx));
+                                pending_switch = Some(Instant::now());
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
             continue;
         }
